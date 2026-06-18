@@ -1,0 +1,62 @@
+adb reverse tcp:3000 tcp:3000
+
+
+ADB Port Forwarding
+
+ADB provides two types:
+
+1. Forward (adb forward)
+adb forward tcp:8080 tcp:8080
+
+Direction:
+
+PC localhost:8080
+        │
+        ▼
+Android Device localhost:8080
+
+Traffic from the PC goes to the Android device.
+
+2. Reverse (adb reverse)
+adb reverse tcp:3000 tcp:3000
+
+Direction:
+
+Android Device localhost:3000
+        │
+        ▼
+PC localhost:3000
+
+Traffic from the Android device goes to the PC.
+
+--------------------------------------------------------------------------------------------------------------------------
+
+Why Developers Use It?
+
+Suppose your backend API is running on your computer:
+
+http://localhost:3000
+
+Your Flutter app is running on a physical phone.
+
+Without port forwarding:
+
+Phone localhost:3000
+
+means the phone itself, not your computer.
+
+Using:
+
+adb reverse tcp:3000 tcp:3000
+
+you forward the phone's port 3000 to your computer's port 3000, allowing the app to access your local API.
+
+-------------------------------------------------------------------------------------------------------------------------------------
+
+Port = a numbered communication endpoint (like room number 3000).
+Port forwarding = redirecting traffic from one port to another.
+adb forward = PC ➜ Android device.
+adb reverse = Android device ➜ PC.
+Commonly used in Flutter/Android development so a mobile app can access APIs running on the developer's computer.
+
+-------------------------------------------------------------------------------------------------------------------------------------

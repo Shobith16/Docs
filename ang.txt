@@ -1,0 +1,319 @@
+1)private _tenantCode$ = new BehaviorSubject<string>(''); private _tenantConfig$ = new BehaviorSubject<TenantConfig | null>(null); 
+what is the use of this ? what this does? how to use it? explain with a simple example.
+
+This is an **RxJS BehaviorSubject**, commonly used in Angular services to **store data and notify all subscribers whenever the data changes**.
+
+---
+
+## What is a BehaviorSubject?
+
+A `BehaviorSubject` is a special type of Observable that:
+
+1. Stores the latest value.
+2. Immediately sends the latest value to new subscribers.
+3. Allows you to update the value using `.next()`.
+
+---
+
+### Your Code
+
+```typescript
+private _tenantCode$ = new BehaviorSubject<string>('');
+
+private _tenantConfig$ = new BehaviorSubject<TenantConfig | null>(null);
+```
+
+Here:
+
+#### `_tenantCode$`
+
+```typescript
+new BehaviorSubject<string>('');
+```
+
+* Stores a string value.
+* Initial value is `''` (empty string).
+
+#### `_tenantConfig$`
+
+```typescript
+new BehaviorSubject<TenantConfig | null>(null);
+```
+
+* Stores a `TenantConfig` object.
+* Initial value is `null`.
+
+---
+
+## Why use it?
+
+Imagine multiple Angular components need the current tenant information.
+
+Without `BehaviorSubject`:
+
+```text
+Component A
+      │
+      ▼
+Service
+      ▲
+      │
+Component B
+```
+
+You would have to manually notify all components whenever the value changes.
+
+With `BehaviorSubject`:
+
+```text
+Component A
+      │
+      ▼
+BehaviorSubject
+      ▲      ▲
+      │      │
+Component B  Component C
+```
+
+Whenever the value changes, all subscribers automatically get the new value.
+
+---
+
+## Simple Example
+
+### Service
+
+```typescript
+import { Injectable } from '@angular/core';
+import { BehaviorSubject } from 'rxjs';
+
+@Injectable()
+export class UserService {
+
+  private userName$ = new BehaviorSubject<string>('Guest');
+
+  getUserName() {
+    return this.userName$.asObservable();
+  }
+
+  setUserName(name: string) {
+    this.userName$.next(name);
+  }
+}
+```
+
+---
+
+### Component A (Update Value)
+
+```typescript
+constructor(private userService: UserService) {}
+
+login() {
+  this.userService.setUserName('Shobith');
+}
+```
+
+---
+
+### Component B (Listen for Changes)
+
+```typescript
+constructor(private userService: UserService) {}
+
+ngOnInit() {
+  this.userService.getUserName().subscribe(name => {
+    console.log(name);
+  });
+}
+```
+
+Output initially:
+
+```text
+Guest
+```
+
+After login:
+
+```text
+Shobith
+```
+
+No refresh needed.
+
+---
+
+## How `.next()` Works
+
+```typescript
+this.userName$.next('Shobith');
+```
+
+Changes stored value:
+
+```text
+Guest
+   ↓
+Shobith
+```
+
+All subscribers are notified immediately.
+
+---
+
+## How `.subscribe()` Works
+
+```typescript
+this.userName$.subscribe(value => {
+   console.log(value);
+});
+```
+
+Whenever the value changes:
+
+```text
+Guest
+Shobith
+Admin
+SuperAdmin
+```
+
+the callback executes automatically.
+
+---
+
+## Why use `$` in variable names?
+
+Convention in Angular/RxJS:
+
+```typescript
+tenantCode$
+user$
+config$
+```
+
+The `$` indicates:
+
+> "This variable is an Observable/stream."
+
+For example:
+
+```typescript
+tenantCode$
+```
+
+means:
+
+```text
+This is not a normal string.
+This is a stream of string values.
+```
+
+---
+
+## Real Tenant Example
+
+```typescript
+private _tenantCode$ = new BehaviorSubject<string>('');
+```
+
+Set tenant:
+
+```typescript
+this._tenantCode$.next('BELVIDERE');
+```
+
+Component 1:
+
+```typescript
+this.service.tenantCode$
+    .subscribe(code => console.log(code));
+```
+
+Output:
+
+```text
+BELVIDERE
+```
+
+Later:
+
+```typescript
+this._tenantCode$.next('ABC');
+```
+
+Output:
+
+```text
+ABC
+```
+
+Every component subscribed to it gets updated automatically.
+
+---
+
+## Difference Between Subject and BehaviorSubject
+
+### Subject
+
+```typescript
+const subject = new Subject<string>();
+
+subject.next('Hello');
+
+subject.subscribe(x => console.log(x));
+```
+
+Output:
+
+```text
+Nothing
+```
+
+The subscriber misses the previous value.
+
+---
+
+### BehaviorSubject
+
+```typescript
+const subject = new BehaviorSubject<string>('Initial');
+
+subject.next('Hello');
+
+subject.subscribe(x => console.log(x));
+```
+
+Output:
+
+```text
+Hello
+```
+
+The subscriber immediately receives the latest value.
+
+---
+
+### Typical Angular Pattern
+
+```typescript
+private _tenantCode$ = new BehaviorSubject<string>('');
+
+public tenantCode$ = this._tenantCode$.asObservable();
+
+setTenantCode(code: string) {
+    this._tenantCode$.next(code);
+}
+```
+
+Usage:
+
+```typescript
+this.tenantService.tenantCode$
+    .subscribe(code => {
+        console.log(code);
+    });
+```
+
+This pattern keeps the subject private so only the service can modify it, while components can only read/subscribe to it.
