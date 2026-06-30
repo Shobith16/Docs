@@ -1,0 +1,312 @@
+
+1) what is the difference between provider and notifier in flutter ?
+
+In Flutter, **Provider** and **Notifier** are both used for **state management**, especially in the Riverpod package, but they solve different problems.
+
+Since you are using Riverpod, I'll explain in that context.
+
+## 1. Provider (Read-only / Simple state)
+
+A **Provider** is used when you only need to **expose a value** and that value does not change by itself.
+
+Think of it as:
+
+> "Here is some data. Anyone can read it."
+
+Example:
+
+```dart
+final appNameProvider = Provider<String>((ref) {
+  return "My Flutter App";
+});
+```
+
+Using it:
+
+```dart
+class HomePage extends ConsumerWidget {
+  const HomePage({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+
+    String appName = ref.watch(appNameProvider);
+
+    return Text(appName);
+  }
+}
+```
+
+Output:
+
+```
+My Flutter App
+```
+
+Here:
+
+* Provider creates the value
+* UI reads the value
+* No modification happens
+
+---
+
+## 2. Notifier (State + Logic)
+
+A **Notifier** is used when you have:
+
+* state
+* business logic
+* actions that change state
+
+Think:
+
+> "I have data, and I know how to update it."
+
+Example: Counter
+
+```dart
+class CounterNotifier extends Notifier<int> {
+
+  @override
+  int build() {
+    return 0;
+  }
+
+
+  void increment() {
+    state++;
+  }
+
+}
+```
+
+Create provider:
+
+```dart
+final counterProvider =
+    NotifierProvider<CounterNotifier, int>(
+        CounterNotifier.new
+    );
+```
+
+Use:
+
+```dart
+class HomePage extends ConsumerWidget {
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+
+    int count = ref.watch(counterProvider);
+
+    return Column(
+      children: [
+
+        Text("$count"),
+
+        ElevatedButton(
+          onPressed: (){
+            ref.read(counterProvider.notifier)
+               .increment();
+          },
+          child: Text("Add")
+        )
+
+      ],
+    );
+  }
+}
+```
+
+Flow:
+
+```
+Button Click
+      |
+      |
+CounterNotifier.increment()
+      |
+      |
+state++
+      |
+      |
+UI rebuilds
+```
+
+---
+
+## Simple comparison
+
+| Feature                 | Provider   | Notifier             |
+| ----------------------- | ---------- | -------------------- |
+| Holds data              | ✅          | ✅                    |
+| Changes data            | ❌          | ✅                    |
+| Contains business logic | ❌          | ✅                    |
+| Good for API calls      | ❌          | ✅                    |
+| Has methods             | ❌          | ✅                    |
+| UI rebuilds on change   | ❌          | ✅                    |
+| Example                 | App config | Login, cart, counter |
+
+---
+
+## Real example: User login
+
+### Provider
+
+```dart
+final userProvider = Provider<User?>((ref){
+
+  return currentUser;
+
+});
+```
+
+You can only read:
+
+```dart
+ref.watch(userProvider);
+```
+
+---
+
+### Notifier
+
+```dart
+class AuthNotifier extends Notifier<User?> {
+
+
+@override
+User? build(){
+
+ return null;
+
+}
+
+
+void login(String email,String password){
+
+  state = User(
+    email: email
+  );
+
+}
+
+
+void logout(){
+
+ state=null;
+
+}
+
+}
+```
+
+Provider:
+
+```dart
+final authProvider =
+NotifierProvider<AuthNotifier,User?>(
+ AuthNotifier.new
+);
+```
+
+Usage:
+
+```dart
+ref.read(authProvider.notifier)
+   .login(
+      "test@gmail.com",
+      "123"
+   );
+```
+
+---
+
+## Provider vs Notifier in your Flutter projects
+
+For your cases:
+
+### API data fetching
+
+Example:
+
+* booking list
+* playlist songs
+* user profile
+
+Use:
+
+```
+Notifier
+```
+
+because:
+
+```
+API call
+   |
+loading state
+   |
+success state
+   |
+error state
+```
+
+Example:
+
+```dart
+class BookingNotifier 
+      extends Notifier<List<Booking>> {
+
+
+@override
+List<Booking> build(){
+
+ return [];
+
+}
+
+
+Future<void> getBookings() async {
+
+  state = await api.getBookings();
+
+}
+
+}
+```
+
+---
+
+### Static values
+
+Example:
+
+```dart
+final baseUrlProvider =
+Provider<String>((ref){
+
+ return "https://api.com";
+
+});
+```
+
+Use Provider.
+
+---
+
+### Easy way to remember
+
+```
+Provider
+=
+"I only give data"
+
+
+Notifier
+=
+"I give data + I control how data changes"
+```
+
+For most application screens (login, CRUD, API, forms, lists), you will mostly use **Notifier**. For constants/configuration/dependencies, use **Provider**.
