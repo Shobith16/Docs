@@ -1,0 +1,37 @@
+To Keep the track on Api Usage!
+
+= If you're using ASP.NET Core
+
+You can also monitor runtime metrics using:
+
+DOTNET-COUNTERS MONITOR --PROCESS-ID <PID>
+
+This shows:
+
+Requests/sec
+CPU usage
+Garbage Collection activity
+Thread Pool utilization
+Memory usage
+
+To download it:
+
+dotnet tool install --global dotnet-counters
+
+to find the process id :
+
+dotnet-counters ps
+
+u will get something like this :
+Ex:
+ 34876  DNSFilter Agent                           [Elevated process - cannot determine path]
+ 16776  Dell.CoreServices.Client                  [Elevated process - cannot determine path]
+ 10860  Dell.Digital.Delivery.Service.SubAgent    [Elevated process - cannot determine path]
+ 
+ then Run the commnd:
+ Dotnet-counters monitor --process-id 34876
+ 
+ it will give u the usage details
+ 
+ 
+ 

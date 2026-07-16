@@ -1,0 +1,216 @@
+# System Design: Bounded Multi-Tenant Parallelism & In-Memory Caching
+
+This document explains two fundamental concepts in modern .NET application architecture:
+1. **Bounded Parallelism** in a multi-tenant environment, showing how dependency injection (DI) scopes prevent cross-tenant data collisions.
+2. **In-Memory Caching** using `IMemoryCache` and Time-To-Live (TTL) strategies to optimize database access.
+
+---
+
+## Part 1: Bounded Parallelism in Multi-Tenant Systems
+
+When executing background work across multiple tenants (e.g., sending notifications, running billing jobs, syncing data), you must choose how to schedule the execution.
+
+### Concurrency Modes Comparison
+
+Suppose you have **20 active tenants**, and processing a job for each tenant takes **3 seconds**.
+
+| Processing Mode | Description | Concurrency Level | Estimated Wall-Clock Time | Resource Risk |
+| :--- | :--- | :--- | :--- | :--- |
+| **Sequential** | Tenants are processed one after another in a single loop. | `MaxDegree = 1` | 20 × 3s = **60 seconds** | Low |
+| **Bounded Parallel** | A set limit of tenants run concurrently. A queued tenant fills a slot as soon as another finishes. | `MaxDegree = 4` | (20 ÷ 4) × 3s = **15 seconds** | Controlled / Safe |
+| **Bounded Parallel** | Higher limit. Faster execution, but higher initial resource usage. | `MaxDegree = 8` | (20 ÷ 8) × 3s ≈ **8 seconds** | Moderate |
+| **Unbounded** | Processes all tenants simultaneously. | `MaxDegree = Unbounded` | ~3 seconds | High (Connection pool exhaustion, API rate limits) |
+
+---
+
+### Step-by-Step Runtime Flow (Parallelism = 4)
+
+If you configure your system to run with a tenant parallelism limit of 4:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant JobTrigger as Job Scheduler
+    participant Runner as Tenant Job Runner
+    participant DB as Global DB
+    participant ParallelPool as Parallel Execution Pool (Max = 4)
+
+    JobTrigger->>Runner: Trigger Job Execution
+    Runner->>DB: Fetch Active Tenants List
+    DB-->>Runner: Return 20 Tenants
+    Note over Runner, ParallelPool: Initialize Parallel.ForEachAsync (Degree = 4)
+    Runner->>ParallelPool: Dispatch Tenant 1, 2, 3, 4
+    Note over ParallelPool: Execution starts concurrently in 4 lanes
+    ParallelPool-->>Runner: Tenant 2 Finishes (Slot opens)
+    Runner->>ParallelPool: Dispatch Tenant 5
+    ParallelPool-->>Runner: Tenant 1 Finishes (Slot opens)
+    Runner->>ParallelPool: Dispatch Tenant 6
+    Note over ParallelPool: Continues until all 20 tenants complete
+    ParallelPool-->>Runner: All Tenants Done
+    Runner-->>JobTrigger: Job Completed
+```
+
+1. **Job Fires**: The scheduler triggers the job. (A concurrency lock like `[DisallowConcurrentExecution]` ensures that if a run takes longer than the trigger interval, the next scheduled run waits).
+2. **Tenant Discovery**: The runner queries the database to retrieve all active tenants (e.g., 20 tenants).
+3. **Execution Pool**: `Parallel.ForEachAsync` starts with `MaxDegreeOfParallelism = 4`. Exactly 4 tenant tasks are active at any given moment.
+4. **Lane Allocation**: Each tenant executes inside its own logical thread/task context:
+   - It initializes an isolated Dependency Injection (DI) scope.
+   - It configures tenant-specific settings (e.g., database connection string, credentials).
+   - It runs the execution logic sequentially **within** that tenant's context (e.g., processing that tenant's notifications one by one).
+5. **Dynamic Draining**: As soon as one tenant completes, the runner immediately starts processing the next queued tenant. The 20 tenants drain in "waves."
+6. **Task Await**: The runner awaits all tasks to complete before reporting the job execution as finished.
+
+---
+
+### Preventing Tenant Collision via DI Scope Isolation
+
+To ensure that tenant data, database connections, and configurations do not cross-contaminate when running in parallel, you must create a new **DI Scope** for each tenant execution thread.
+
+```
+       ┌─────────── Lane 1 (Tenant A) ───────────┐   ┌─────────── Lane 2 (Tenant B) ───────────┐
+       │ scope1 (Isolated Container)             │   │ scope2 (Isolated Container)             │
+       │                                         │   │                                         │
+       │  TenantContext: ConnectionString = A    │   │  TenantContext: ConnectionString = B    │
+       │  DatabaseConnection: Connects to DB A   │   │  DatabaseConnection: Connects to DB B   │
+       │  NotificationService: Scoped instance   │   │  NotificationService: Scoped instance   │
+       │  Local Stack: Recipients for Tenant A   │   │  Local Stack: Recipients for Tenant B   │
+       └─────────────────────────────────────────┘   └─────────────────────────────────────────┘
+                        │                                             │
+                        └─────────────── Config & Factory ────────────┘
+                                               │
+                                               ▼ (Thread-safe shared services)
+                                ┌──────────────────────────────┐
+                                │ SHARED Singletons:           │
+                                │  - ConfigurationProvider     │
+                                │  - HttpClientFactory         │
+                                │  - GlobalCache               │
+                                └──────────────────────────────┘
+```
+
+#### How Scope Isolation Works
+
+When the parallel loop processes a tenant, it does not use the root application container. Instead, it generates a temporary container (`IServiceScope`):
+
+```csharp
+// Inside the Parallel Tenant Loop
+await Parallel.ForEachAsync(tenants, new ParallelOptions { MaxDegreeOfParallelism = 4 }, async (tenant, cancellationToken) =>
+{
+    // 1. Create a fresh, isolated DI container specifically for this tenant
+    using var scope = _serviceProvider.CreateScope();
+    
+    // 2. Resolve the scoped TenantContext inside this container
+    var tenantContext = scope.ServiceProvider.GetRequiredService<ITenantContext>();
+    tenantContext.ConnectionString = $"Host=ServerAddress;Database=db_{tenant.Code};...";
+    
+    // 3. Resolve the service to execute
+    var workerService = scope.ServiceProvider.GetRequiredService<INotificationService>();
+    
+    try
+    {
+        // 4. Run execution logic - all dependencies resolved here use the tenant's connection
+        await workerService.ProcessNotificationsAsync(tenant.Code);
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Failed to process notifications for tenant {TenantCode}", tenant.Code);
+    }
+}); // 5. Scope is disposed here. Connections are closed and resources freed.
+```
+
+#### Why Data and Connections Cannot Collide
+
+* **Scoped Services**: Classes registered as `Scoped` are instantiated once **per DI scope**. Tenant A's DI scope resolves its own instance of `NotificationService` and `DatabaseConnection`, while Tenant B resolves completely separate instances.
+* **Connection Pooling Isolation**: ADO.NET connection pooling is keyed by the connection string. Because Tenant A uses `db_tenant_a` and Tenant B uses `db_tenant_b`, they query separate databases, using separate physical connections from different pools.
+* **Execution Stack Isolation**: Local variables created inside async methods (such as lists of recipients or response statuses) live on the execution stack of that specific asynchronous task. They are never stored in shared static variables.
+
+---
+
+## Part 2: In-Memory Caching and IMemoryCache
+
+A **Cache** is a temporary storage area containing copy-on-demand data. Rather than performing resource-intensive operations (such as making a SQL query or calling an external API) every time data is requested, you store the result in memory for reuse.
+
+```
+Without Caching:
+[App Service] ─── (Every Request) ───► [SQL Database / API] (Heavy load, high latency)
+
+With Caching:
+[App Service] ───► [Memory Cache (RAM)] ─── (If missing) ───► [SQL Database / API]
+```
+
+### Key Caching Terminology
+
+* **RAM Storage**: The data is kept in the server's random-access memory (RAM). Accessing RAM is orders of magnitude faster than querying a remote database.
+* **TTL (Time To Live)**: The lifespan configuration of a cached item. It specifies how long the cache should keep a copy of the data before discarding it.
+* **Cache Eviction**: The removal of items from the cache. This can occur because the TTL expired, the server is running low on memory, or the data was manually invalidated.
+
+---
+
+### Why is TTL Crucial?
+
+Without a Time-To-Live (TTL) configuration, data cached in memory remains there indefinitely. If an administrator updates a setting (e.g., changing API credentials) in the database, the running application would remain unaware of the change because it would continue reading the stale value from memory.
+
+With a TTL of **10 minutes**:
+
+```
+Time     Event                                  Result
+──────────────────────────────────────────────────────────────────────────
+12:00    User requests Configuration            Cache Miss -> Read DB -> Store in Cache (10m TTL)
+12:02    User requests Configuration            Cache Hit  -> Read from RAM
+12:05    Admin updates Config in DB             (Database updated, Cache still holds old value)
+12:06    User requests Configuration            Cache Hit  -> Read old value from RAM
+12:10    TTL Expires                            Cache Evicts the old value
+12:11    User requests Configuration            Cache Miss -> Read DB (gets new value) -> Store in Cache
+```
+
+By adding a TTL, you guarantee that system updates are automatically picked up within a predictable time window.
+
+---
+
+### Implementation Pattern in .NET (`IMemoryCache`)
+
+Using the `.NET` built-in `IMemoryCache`, you can encapsulate caching using the `GetOrCreate` pattern.
+
+#### 1. The Clean Caching Pattern
+
+```csharp
+using Microsoft.Extensions.Caching.Memory;
+
+public class ConfigurationService : IConfigurationService
+{
+    private readonly IDatabaseRepository _repository;
+    private readonly IMemoryCache _cache;
+
+    public ConfigurationService(IDatabaseRepository repository, IMemoryCache cache)
+    {
+        _repository = repository;
+        _cache = cache;
+    }
+
+    public async Task<ServiceConfig> GetConfigAsync(string configKey)
+    {
+        string cacheKey = $"config_{configKey}";
+
+        // Look up cache. If missing, invoke the factory method to fetch it and set TTL.
+        return await _cache.GetOrCreateAsync(cacheKey, async entry =>
+        {
+            // Set cache duration (Time To Live)
+            entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(10);
+            
+            // Log that we are hitting the database (useful for debugging cache misses)
+            Console.WriteLine($"Cache miss for key: {cacheKey}. Fetching from Database...");
+            
+            // Fetch from database
+            return await _repository.FetchConfigFromDbAsync(configKey);
+        });
+    }
+}
+```
+
+#### 2. Comparison: Database Queries Over Time
+
+Assume a background task checks configuration settings once every minute.
+
+* **Without Caching (over 1 hour)**: 60 database queries.
+* **With Caching (10-minute TTL, over 1 hour)**: 6 database queries.
+
+This reduction decreases resource consumption on your database cluster, improves response times, and saves CPU cycles that would otherwise be spent deserializing and parsing the configuration payload on every loop iteration.
