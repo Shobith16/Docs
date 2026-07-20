@@ -1,8 +1,9 @@
-# System Design: Bounded Multi-Tenant Parallelism & In-Memory Caching
+# System Design: Bounded Multi-Tenant Parallelism, Caching & Hardened DB-Queue Lifecycle
 
-This document explains two fundamental concepts in modern .NET application architecture:
+This document explains three fundamental concepts in modern .NET application architecture:
 1. **Bounded Parallelism** in a multi-tenant environment, showing how dependency injection (DI) scopes prevent cross-tenant data collisions.
 2. **In-Memory Caching** using `IMemoryCache` and Time-To-Live (TTL) strategies to optimize database access.
+3. **Hardened DB-Queue Lifecycle** detailing the secure Claim-Process-Complete-Reap pattern used for resilient database-backed message queues.
 
 ---
 
@@ -214,3 +215,116 @@ Assume a background task checks configuration settings once every minute.
 * **With Caching (10-minute TTL, over 1 hour)**: 6 database queries.
 
 This reduction decreases resource consumption on your database cluster, improves response times, and saves CPU cycles that would otherwise be spent deserializing and parsing the configuration payload on every loop iteration.
+
+---
+
+## Part 3: Hardened Database-Queue (The Claim-Process-Complete-Reap Cycle)
+
+In high-reliability system designs, a relational database is frequently configured to act as a **hardened message queue**. To ensure that tasks (e.g., outgoing emails, faxes, SMS, API syncs) are processed exactly once, are resilient to worker crashes, and handle poisoned payloads gracefully, a standardized **Claim-Process-Complete-Reap** pattern is implemented.
+
+```
+       ┌──────────────────────────────┐
+       │             Idle             │◄─────────────────────────────┐
+       └──────────────┬───────────────┘                              │
+                      │                                              │
+                      │  1. CLAIM (Lock rows)                        │
+                      ▼                                              │
+       ┌──────────────────────────────┐                              │
+       │           Claimed            │                              │
+       └──────────────┬───────────────┘                              │
+                      │                                              │
+                      │  2. PROCESS (Execute worker)                 │
+                      ▼                                              │
+               [Success / Fail?]                                     │
+               /               \                                     │
+         (Success)           (Failure)                               │
+           /                   \                                     │
+          ▼                     ▼                                    │
+   3a. COMPLETE           3b. EVALUATE RETRY                         │
+(Delete/Mark Completed)   (Attempts < MaxAttempts?)                  │
+                               /       \                             │
+                            (Yes)      (No)                          │
+                             /           \                           │
+                            ▼             ▼                          │
+                     [Release row]   [Dead-Letter]                   │
+                            │             │                          │
+                            ▼             ▼                          │
+                     (Back to Idle)  (Dead State)                    │
+                            ▲                                        │
+                            │                                        │
+                            │  4. REAP (Release after LeaseMinutes)  │
+                            └────────────────────────────────────────┘
+```
+
+### Key Queue Parameters Explained
+
+These four properties control queue safety and concurrency behavior. They are typically loaded via application configuration files.
+
+| Configuration Key | What it Controls | Passed To | Rationale |
+| :--- | :--- | :--- | :--- |
+| **Worker ID** | Identifies the physical node or container instance currently locking the queue rows. | `Claim` Stored Procedure | In clustered environments with multiple replica nodes, it ensures that only the node holding the lease processes the locked rows. If empty, it falls back to the machine name. |
+| **Batch Size** | Limits the number of queue rows a single worker claims in a single execution loop. | `Claim` Stored Procedure | Prevents a single worker from running out of memory or locking the database by loading too many rows at once (e.g., claiming 10,000 items in one SQL transaction). |
+| **Lease Minutes** | The timeout window before a claimed row is assumed abandoned. | `Claim` & `Reap` Stored Procedures | Acts as a crash-recovery safety net. If a worker dies mid-execution, the database eventually frees the rows to be retried. It must exceed the maximum possible time to process a single batch. |
+| **Max Attempts** | The maximum number of failed processing attempts allowed before giving up. | `Complete` Stored Procedure | Protects the system from "poison messages" (e.g., an invalid phone number or corrupted payload). If a row fails repeatedly, it is eventually moved to a dead-letter state to prevent endless retries. |
+
+---
+
+### Step-by-Step Lifecycle Flow
+
+#### 1. Claim (Locking)
+The background worker calls the claiming database procedure.
+* **Input**: `WorkerId`, `BatchSize`, `LeaseMinutes`
+* **Action**: The database atomically finds up to `BatchSize` pending items, stamps their `ClaimedBy` with the `WorkerId` and `ClaimedDate` with the current timestamp, and returns them to the caller. These items are now locked and invisible to other worker instances.
+
+#### 2. Process
+The application processes each item in the batch sequentially.
+
+#### 3. Complete (Result Logging)
+For each processed item, the application reports the outcome back to the database.
+* **Success**: The item is marked as complete (or deleted). Its locks are cleared.
+* **Failure**: The database increments the item's attempt count.
+  - If `Attempts < MaxAttempts`: The database clears the lease, returning the row to the queue so it can be claimed again on the next cycle.
+  - If `Attempts >= MaxAttempts`: The database moves the row to a **Dead-Letter State** (e.g., `status = 'FAIL'`) and logs the last error message. A human must manually review or clean this record.
+
+#### 4. Reap (Recovery)
+A separate background cleaner runs periodically (e.g., every 5 minutes).
+* **Input**: `LeaseMinutes`
+* **Action**: The database scans for items where the status is active, but `ClaimedDate` is older than `LeaseMinutes` ago. This indicates the processing worker crashed or was killed. The database automatically clears their lease parameters, resetting them back to a pending state so they can be processed by a healthy worker node.
+
+---
+
+### Implementation Configuration Model in C#
+
+```csharp
+using Microsoft.Extensions.Configuration;
+
+public readonly record struct QueueClaimOptions(string WorkerId, int BatchSize, int LeaseMinutes, int MaxAttempts)
+{
+    public static QueueClaimOptions Resolve(IConfiguration config)
+    {
+        // 1. Resolve WorkerId, fall back to MachineName if not configured
+        var workerId = config["QueueSettings:WorkerId"];
+        if (string.IsNullOrWhiteSpace(workerId))
+        {
+            workerId = Environment.MachineName;
+        }
+
+        // 2. Resolve BatchSize (how many items to process at once), default to 50
+        var batchSize = int.TryParse(config["QueueSettings:BatchSize"], out var b) && b > 0 ? b : 50;
+
+        // 3. Resolve LeaseMinutes (how long locks last), default to 5 minutes
+        var leaseMinutes = int.TryParse(config["QueueSettings:LeaseMinutes"], out var l) && l > 0 ? l : 5;
+
+        // 4. Resolve MaxAttempts (poison-pill threshold), default to 5 retries
+        var maxAttempts = int.TryParse(config["QueueSettings:MaxAttempts"], out var m) && m > 0 ? m : 5;
+
+        return new QueueClaimOptions(workerId, batchSize, leaseMinutes, maxAttempts);
+    }
+}
+```
+
+THE PRINCIPLE
+Cache reference/config (rarely changes, tolerant of a few minutes' staleness).
+Never cache work-queue, transactional, or audit (must reflect current state, must run every time).
+
+
